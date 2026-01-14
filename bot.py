@@ -152,11 +152,11 @@ Then output ONLY this JSON block:
 
 DERIVED_JSON:
 [
-  {
+  {{
     "hebrew": "...",
     "translit": "...",
     "english": "..."
-  }
+  }}
 ]
 """
 
@@ -247,8 +247,27 @@ def call_deepseek(word: str) -> Dict[str, Any]:
         if not isinstance(derived, list):
             logger.warning("DERIVED_JSON is not a list, wrapping in list")
             derived = [derived]
-    except Exception as e:
+        
+        # Validate structure of derived items
+        validated_derived = []
+        for idx, item in enumerate(derived):
+            if not isinstance(item, dict):
+                logger.warning(f"Derived item {idx} is not a dict: {type(item)}")
+                continue
+            if "hebrew" not in item or "translit" not in item or "english" not in item:
+                logger.warning(f"Derived item {idx} missing required keys: {item.keys()}")
+                continue
+            validated_derived.append(item)
+        
+        derived = validated_derived
+        
+    except json.JSONDecodeError as e:
         logger.warning(f"Failed to parse DERIVED_JSON: {e}")
+        logger.warning(f"JSON block (first 300 chars): {json_block[:300]}")
+        logger.warning(f"JSON block (last 100 chars): {json_block[-100:]}")
+        derived = []
+    except Exception as e:
+        logger.warning(f"Unexpected error parsing DERIVED_JSON: {e}")
         logger.warning(f"Attempted to parse: {json_block[:200]}")
         derived = []
 
@@ -355,7 +374,16 @@ def handle_message(msg: Dict[str, Any]):
         
         buttons = []
         for i, d in enumerate(derived):
-            label = f"{d['hebrew']} - {d['translit']} - {d['english']}"
+            # Safely access dict keys with defaults
+            hebrew = d.get("hebrew", "")
+            translit = d.get("translit", "")
+            english = d.get("english", "")
+            
+            if not hebrew or not translit or not english:
+                logger.warning(f"Skipping derived item {i} with missing fields: {d}")
+                continue
+            
+            label = f"{hebrew} - {translit} - {english}"
             if len(label) > 60:
                 label = label[:57] + "..."
             buttons.append([{
@@ -388,11 +416,21 @@ def handle_callback(cb: Dict[str, Any]):
     
     d = cached["derived"][idx]
     
+    # Validate derived item structure
+    hebrew = d.get("hebrew")
+    translit = d.get("translit")
+    english = d.get("english")
+    
+    if not hebrew or not translit or not english:
+        logger.error(f"Invalid derived item at index {idx}: {d}")
+        answer_callback(cb_id, "❌ Invalid data")
+        return
+    
     try:
         saved = append_to_sheet(
-            d["hebrew"],
-            d["translit"],
-            d["english"],
+            hebrew,
+            translit,
+            english,
             cached["heb_root"],
             cached["ar_root"],
             cached["ar_examples"]
