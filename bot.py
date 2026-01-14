@@ -125,7 +125,6 @@ Derived words must:
 - No archaic or biblical forms
 """
 
-
 USER_INSTRUCTIONS = """
 Word: {word}
 
@@ -185,28 +184,38 @@ def call_deepseek(word: str) -> Dict[str, Any]:
     else:
         raise RuntimeError("DeepSeek failed after retries")
     
-    # Robust JSON extraction
-    main_text = text
-    derived = []
-    
-    if "DERIVED_JSON:" in text:
-        main_text, json_part = text.split("DERIVED_JSON:", 1)
+    # -------- Robust JSON extraction --------
+    # Remove markdown fences if present
+    cleaned = text.replace("```json", "").replace("```", "").strip()
+    main_text = cleaned
+    derived: List[Dict[str, Any]] = []
+
+    # Prefer an explicit DERIVED_JSON: [...] block
+    m = re.search(r"DERIVED_JSON:\s*(\[[\s\S]*\])", cleaned)
+    if m:
+        json_block = m.group(1).strip()
+        # everything before DERIVED_JSON is the explanatory text
+        main_text = cleaned[:m.start()].strip()
     else:
-        m = re.search(r"\[\s*{.*}\s*\]", text, re.DOTALL)
+        # Fallback: first JSON array anywhere in the text
+        m = re.search(r"(\[[\s\S]*\])", cleaned)
         if m:
-            json_part = m.group(0)
-            main_text = text.replace(json_part, "").strip()
+            json_block = m.group(1).strip()
+            # remove the array from the main text
+            main_text = (cleaned[:m.start()] + cleaned[m.end():]).strip()
         else:
+            logger.warning("No JSON found in DeepSeek response")
             return {"main_text": text.strip(), "derived": []}
-    
-    json_part = re.sub(r"^```json|```$", "", json_part).strip()
-    
+
     try:
-        derived = json.loads(json_part)
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse DERIVED_JSON")
+        derived = json.loads(json_block)
+        if not isinstance(derived, list):
+            logger.warning("DERIVED_JSON is not a list, wrapping in list")
+            derived = [derived]
+    except Exception as e:
+        logger.warning(f"Failed to parse DERIVED_JSON: {e}")
         derived = []
-    
+
     return {
         "main_text": main_text.strip(),
         "derived": derived
@@ -310,7 +319,6 @@ def handle_message(msg: Dict[str, Any]):
         
         buttons = []
         for i, d in enumerate(derived):
-            # FIXED: Use hyphen not en-dash
             label = f"{d['hebrew']} - {d['translit']} - {d['english']}"
             if len(label) > 60:
                 label = label[:57] + "..."
