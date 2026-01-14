@@ -190,19 +190,54 @@ def call_deepseek(word: str) -> Dict[str, Any]:
     main_text = cleaned
     derived: List[Dict[str, Any]] = []
 
-    # Prefer an explicit DERIVED_JSON: [...] block
-    m = re.search(r"DERIVED_JSON:\s*(\[[\s\S]*\])", cleaned)
-    if m:
-        json_block = m.group(1).strip()
-        # everything before DERIVED_JSON is the explanatory text
-        main_text = cleaned[:m.start()].strip()
+    # Look for DERIVED_JSON: marker
+    json_start = cleaned.find("DERIVED_JSON:")
+    if json_start != -1:
+        # Find the opening bracket after DERIVED_JSON:
+        bracket_start = cleaned.find("[", json_start)
+        if bracket_start != -1:
+            # Count brackets to find the matching closing bracket
+            bracket_count = 0
+            bracket_end = -1
+            for i in range(bracket_start, len(cleaned)):
+                if cleaned[i] == '[':
+                    bracket_count += 1
+                elif cleaned[i] == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        bracket_end = i + 1
+                        break
+            
+            if bracket_end != -1:
+                json_block = cleaned[bracket_start:bracket_end].strip()
+                main_text = cleaned[:json_start].strip()
+            else:
+                logger.warning("Could not find matching bracket for DERIVED_JSON")
+                return {"main_text": text.strip(), "derived": []}
+        else:
+            logger.warning("No opening bracket found after DERIVED_JSON:")
+            return {"main_text": text.strip(), "derived": []}
     else:
-        # Fallback: first JSON array anywhere in the text
-        m = re.search(r"(\[[\s\S]*\])", cleaned)
-        if m:
-            json_block = m.group(1).strip()
-            # remove the array from the main text
-            main_text = (cleaned[:m.start()] + cleaned[m.end():]).strip()
+        # Fallback: try to find first JSON array
+        bracket_start = cleaned.find("[")
+        if bracket_start != -1:
+            bracket_count = 0
+            bracket_end = -1
+            for i in range(bracket_start, len(cleaned)):
+                if cleaned[i] == '[':
+                    bracket_count += 1
+                elif cleaned[i] == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        bracket_end = i + 1
+                        break
+            
+            if bracket_end != -1:
+                json_block = cleaned[bracket_start:bracket_end].strip()
+                main_text = (cleaned[:bracket_start] + cleaned[bracket_end:]).strip()
+            else:
+                logger.warning("No JSON found in DeepSeek response")
+                return {"main_text": text.strip(), "derived": []}
         else:
             logger.warning("No JSON found in DeepSeek response")
             return {"main_text": text.strip(), "derived": []}
@@ -214,6 +249,7 @@ def call_deepseek(word: str) -> Dict[str, Any]:
             derived = [derived]
     except Exception as e:
         logger.warning(f"Failed to parse DERIVED_JSON: {e}")
+        logger.warning(f"Attempted to parse: {json_block[:200]}")
         derived = []
 
     return {
