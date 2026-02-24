@@ -35,8 +35,12 @@ client = None
 # cache last result per chat to avoid big callback payloads
 LAST_RESULTS: Dict[int, Dict[str, Any]] = {}
 
-# Accept only Hebrew letters (no nikkud/vowel points)
+# Accept only Hebrew letters (no nikkud/vowel points) - single word
 HEBREW_WORD_RE = re.compile(r"^[\u05D0-\u05EA]+$")
+
+# Hebrew phrase: multiple space-separated tokens, each token is Hebrew letters
+# (allows prefixes attached to words - word boundary = space)
+HEBREW_PHRASE_RE = re.compile(r"^[\u05D0-\u05EA]+([ \u05D0-\u05EA?!,\.\u05F3\u05F4]+)$")
 
 # --------------------
 # Telegram helpers
@@ -93,6 +97,7 @@ def init_google_sheets():
     logger.info("Google Sheets initialized")
 
 # --------------------
+# MODE 1: Single-word etymology
 # DeepSeek prompt
 # --------------------
 SYSTEM_PROMPT = """
@@ -161,7 +166,35 @@ DERIVED_JSON:
 """
 
 # --------------------
-# DeepSeek call
+# MODE 2: Phrase/sentence breakdown
+# --------------------
+PHRASE_SYSTEM_PROMPT = """
+You are a Hebrew language tutor helping a beginner learner understand modern Hebrew sentences.
+
+CRITICAL RULES:
+1. The input is a modern Hebrew phrase or sentence (multiple words).
+2. Break it down word by word, where a "word" is defined by spaces — attached prefixes/articles/prepositions count as ONE word with what follows.
+3. SKIP: subject pronouns (אני, אתה, את, הוא, היא, אנחנו, אתם, הן, הם), question particles (האם), and common function words like: איפה, איך, מתי, למה, מה, מי, כן, לא — UNLESS they are the main meaningful content.
+4. DO NOT skip: object pronouns, possessive suffixes, definite articles attached to meaningful words, prepositions attached to meaningful words.
+5. For each kept word: give Hebrew, transliteration in parentheses, then English meaning. Keep it concise.
+6. Output ONLY the word list, one per line. No intro, no summary sentence, no headers.
+
+Output format — each line exactly like this:
+WORD (translit) meaning1 / meaning2
+
+Example output:
+הציפורן (ha-tsipóren) the nail / nail
+הפתוחה (ha-ptukhá) the open one / open
+שלך (shelkhá) yours / your
+פועלת (po'élet) works / operates
+"""
+
+PHRASE_USER_INSTRUCTIONS = """
+Phrase: {phrase}
+"""
+
+# --------------------
+# DeepSeek call - single word
 # --------------------
 def call_deepseek(word: str) -> Dict[str, Any]:
     messages = [
@@ -277,6 +310,28 @@ def call_deepseek(word: str) -> Dict[str, Any]:
     }
 
 # --------------------
+# DeepSeek call - phrase breakdown
+# --------------------
+def call_deepseek_phrase(phrase: str) -> str:
+    messages = [
+        {"role": "system", "content": PHRASE_SYSTEM_PROMPT},
+        {"role": "user", "content": PHRASE_USER_INSTRUCTIONS.format(phrase=phrase)}
+    ]
+    
+    for _ in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                temperature=TEMPERATURE
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"DeepSeek error, retrying: {e}")
+            time.sleep(2)
+    raise RuntimeError("DeepSeek failed after retries")
+
+# --------------------
 # Parsing roots
 # --------------------
 def extract_roots_and_arabic(main_text: str):
@@ -335,6 +390,18 @@ def append_to_sheet(hebrew, translit, english, heb_root, ar_root, ar_examples):
     return True
 
 # --------------------
+# Input detection helper
+# --------------------
+def is_hebrew_text(text: str) -> bool:
+    """Returns True if text contains Hebrew letters (allowing spaces and punctuation)."""
+    return bool(re.search(r'[\u05D0-\u05EA]', text))
+
+def count_hebrew_words(text: str) -> int:
+    """Count space-separated tokens that contain Hebrew letters."""
+    tokens = text.strip().split()
+    return sum(1 for t in tokens if re.search(r'[\u05D0-\u05EA]', t))
+
+# --------------------
 # Telegram handlers
 # --------------------
 def handle_message(msg: Dict[str, Any]):
@@ -345,21 +412,42 @@ def handle_message(msg: Dict[str, Any]):
     if text == "/start":
         send_message(chat_id, 
             "👋 <b>Welcome to Hebrew Etymology Bot!</b>\n\n"
-            "📝 Send me a single Hebrew word (letters only)\n"
-            "🔍 I'll analyze its root, etymology, and Arabic cognates\n"
-            "💾 Tap buttons to save derived words to your Google Sheet\n\n"
-            "Example: send <b>מכין</b>"
+            "📝 <b>Single word</b> → root, etymology &amp; Arabic cognates\n"
+            "   Example: send <b>מכין</b>\n\n"
+            "📖 <b>Phrase or sentence</b> → word-by-word breakdown\n"
+            "   Example: send <b>האם הציפורן הפתוחה שלך פועלת</b>\n\n"
+            "💾 Tap buttons (single-word mode) to save derived words to your Google Sheet"
         )
         return
     
-    if not HEBREW_WORD_RE.match(text):
+    if not is_hebrew_text(text):
+        send_message(chat_id, "❗ Please send Hebrew text — either a single word or a phrase/sentence.")
+        return
+
+    word_count = count_hebrew_words(text)
+
+    # ── MODE 2: phrase/sentence (2+ Hebrew words) ──
+    if word_count >= 2:
+        send_message(chat_id, "🔍 Breaking down phrase...")
+        try:
+            breakdown = call_deepseek_phrase(text)
+            send_message(chat_id, breakdown)
+        except Exception as e:
+            logger.exception("Error processing phrase")
+            send_message(chat_id, f"❌ Error: {e}")
+        return
+
+    # ── MODE 1: single word ──
+    # Strip any non-Hebrew characters for the single-word check
+    word_only = re.sub(r'[^\u05D0-\u05EA]', '', text)
+    if not HEBREW_WORD_RE.match(word_only):
         send_message(chat_id, "❗ Please send a single Hebrew word (letters only, no vowel points).")
         return
-    
+
     send_message(chat_id, "🤖 Analyzing...")
     
     try:
-        result = call_deepseek(text)
+        result = call_deepseek(word_only)
         main_text = result["main_text"]
         derived = result["derived"]
         
