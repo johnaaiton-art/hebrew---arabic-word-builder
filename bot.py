@@ -3,7 +3,7 @@ import json
 import time
 import logging
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 import requests
 from openai import OpenAI
 import gspread
@@ -19,6 +19,7 @@ GOOGLE_CREDS_FILE = 'service_account.json'
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 TEMPERATURE = 0.2
+MAX_CACHED_CHATS = 100  # Prevent memory leak
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,20 +28,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------
-# Globals (initialized in main)
+# Globals
 # --------------------
-sheet = None
+sheet_hebrew = None
+sheet_arabic = None
 client = None
 
-# cache last result per chat to avoid big callback payloads
+# cache last result per chat with size limit
 LAST_RESULTS: Dict[int, Dict[str, Any]] = {}
 
-# Accept only Hebrew letters (no nikkud/vowel points) - single word
+# Hebrew regex
 HEBREW_WORD_RE = re.compile(r"^[\u05D0-\u05EA]+$")
 
-# Hebrew phrase: multiple space-separated tokens, each token is Hebrew letters
-# (allows prefixes attached to words - word boundary = space)
-HEBREW_PHRASE_RE = re.compile(r"^[\u05D0-\u05EA]+([ \u05D0-\u05EA?!,\.\u05F3\u05F4]+)$")
+# Arabic regex (Basic Arabic + extended)
+ARABIC_WORD_RE = re.compile(r"^[\u0600-\u06FF\u0750-\u077F]+$")
 
 # --------------------
 # Telegram helpers
@@ -86,19 +87,34 @@ def init_deepseek():
     logger.info("DeepSeek initialized")
 
 def init_google_sheets():
-    global sheet
+    global sheet_hebrew, sheet_arabic
     if not os.path.exists(GOOGLE_CREDS_FILE):
         raise ValueError(f"Google credentials file not found: {GOOGLE_CREDS_FILE}")
     
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
     gc = gspread.authorize(creds)
-    sheet = gc.open_by_key(SHEET_ID).sheet1
-    logger.info("Google Sheets initialized")
+    
+    spreadsheet = gc.open_by_key(SHEET_ID)
+    
+    # Hebrew tab
+    try:
+        sheet_hebrew = spreadsheet.worksheet("Hebrew")
+    except gspread.exceptions.WorksheetNotFound:
+        sheet_hebrew = spreadsheet.add_worksheet(title="Hebrew", rows="1000", cols="6")
+        sheet_hebrew.append_row(["Hebrew", "Transliteration", "English", "Hebrew Root", "Arabic Cognate", "Arabic Examples"])
+    
+    # Arabic tab
+    try:
+        sheet_arabic = spreadsheet.worksheet("Arabic")
+    except gspread.exceptions.WorksheetNotFound:
+        sheet_arabic = spreadsheet.add_worksheet(title="Arabic", rows="1000", cols="4")
+        sheet_arabic.append_row(["English", "Arabic", "Transliteration", "Original Word"])
+    
+    logger.info("Google Sheets initialized (Hebrew + Arabic tabs)")
 
 # --------------------
-# MODE 1: Single-word etymology
-# DeepSeek prompt
+# Hebrew prompts
 # --------------------
 SYSTEM_PROMPT = """
 You are a Semitic linguistics assistant for a beginner Hebrew learner.
@@ -166,7 +182,7 @@ DERIVED_JSON:
 """
 
 # --------------------
-# MODE 2: Phrase/sentence breakdown
+# Hebrew phrase prompt
 # --------------------
 PHRASE_SYSTEM_PROMPT = """
 You are a Hebrew language tutor helping a beginner learner understand modern Hebrew sentences.
@@ -194,9 +210,148 @@ Phrase: {phrase}
 """
 
 # --------------------
-# DeepSeek call - single word
+# Arabic prompt
 # --------------------
-def call_deepseek(word: str) -> Dict[str, Any]:
+ARABIC_SYSTEM_PROMPT = """
+You are an Arabic linguistics assistant for a beginner learner.
+
+CRITICAL RULES:
+1. The input is ONE Arabic word in Arabic script.
+2. Identify its 3-consonant root (جذر) and core meaning.
+3. If there are prefixes or suffixes attached to the root, identify them (e.g., ي for present tense, ت for you, ـت for past tense I, etc.)
+4. Identify if there is a plausible Hebrew cognate (same root or very similar meaning). If yes, provide the Hebrew word with transliteration and meaning. If not, say "no known Hebrew cognate".
+5. Provide 4 common conjugations from the same root, but ONLY if they are commonly used in everyday Modern Standard Arabic (not rare/formal/academic):
+   - First person present (I do): أنا + present tense
+   - Second person masculine present (you do): أنتَ + present tense
+   - Third person masculine present (he does): هو + present tense
+   - First person past (I did): أنا + past tense
+6. Also provide 1-3 other common derived words from the same root (nouns, adjectives, etc.) that are commonly used.
+7. Use simple Latin transliteration (no diacritics) for both Arabic and Hebrew.
+8. Do NOT guess roots. If unsure about the root, say: root unknown.
+
+Output format:
+
+MAIN TEXT:
+Word: {word} (transliteration)
+Root: (consonants with hyphens) - meaning: "core meaning"
+Prefixes/Suffixes: (if any, otherwise say "none")
+Hebrew cognate: Hebrew word (translit) - meaning (OR "no known Hebrew cognate")
+
+Common conjugations (from this root):
+• I do: أنا + verb (translit) - meaning
+• You (m) do: أنتَ + verb (translit) - meaning
+• He does: هو + verb (translit) - meaning
+• I did: أنا + verb (past) (translit) - meaning
+
+Other common words from this root:
+• word (translit) - meaning
+• word (translit) - meaning (if applicable)
+
+Then output this JSON block for the buttons:
+
+BUTTONS_JSON:
+[
+  {{
+    "arabic": "كَتَبْتُ",
+    "translit": "katabtu",
+    "english": "I wrote",
+    "category": "I_past"
+  }},
+  {{
+    "arabic": "أَكْتُبُ",
+    "translit": "aktubu",
+    "english": "I write",
+    "category": "I_present"
+  }}
+]
+
+Only include the 4 conjugations plus any other common derived words (max 3) in BUTTONS_JSON.
+"""
+
+ARABIC_USER_INSTRUCTIONS = """
+Arabic word: {word}
+"""
+
+# --------------------
+# DeepSeek calls with safe JSON extraction
+# --------------------
+def extract_json_array(text: str, marker: str) -> Tuple[str, List[Dict]]:
+    """Safely extract JSON array from DeepSeek response.
+    Returns (main_text, json_array)"""
+    cleaned = text.replace("```json", "").replace("```", "").strip()
+    main_text = cleaned
+    json_array = []
+    
+    # Look for marker
+    marker_pos = cleaned.find(marker) if marker else -1
+    
+    if marker_pos != -1:
+        # Find opening bracket after marker
+        bracket_start = cleaned.find("[", marker_pos)
+        if bracket_start == -1:
+            logger.warning(f"Marker '{marker}' found but no '[' after it")
+            return main_text, json_array
+        
+        # Find matching closing bracket
+        bracket_count = 0
+        bracket_end = -1
+        for i in range(bracket_start, len(cleaned)):
+            if cleaned[i] == '[':
+                bracket_count += 1
+            elif cleaned[i] == ']':
+                bracket_count -= 1
+                if bracket_count == 0:
+                    bracket_end = i + 1
+                    break
+        
+        if bracket_end == -1:
+            logger.warning(f"Unmatched brackets after marker '{marker}'")
+            return main_text, json_array
+        
+        json_block = cleaned[bracket_start:bracket_end].strip()
+        main_text = cleaned[:marker_pos].strip()
+        
+        try:
+            parsed = json.loads(json_block)
+            if isinstance(parsed, list):
+                json_array = parsed
+            elif isinstance(parsed, dict):
+                json_array = [parsed]
+            else:
+                logger.warning(f"Parsed JSON is not list/dict: {type(parsed)}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON decode error: {e}")
+            logger.warning(f"Problematic JSON (first 300 chars): {json_block[:300]}")
+    else:
+        # No marker - try to find any JSON array
+        bracket_start = cleaned.find("[")
+        if bracket_start != -1:
+            bracket_count = 0
+            bracket_end = -1
+            for i in range(bracket_start, len(cleaned)):
+                if cleaned[i] == '[':
+                    bracket_count += 1
+                elif cleaned[i] == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        bracket_end = i + 1
+                        break
+            
+            if bracket_end != -1:
+                json_block = cleaned[bracket_start:bracket_end].strip()
+                main_text = (cleaned[:bracket_start] + cleaned[bracket_end:]).strip()
+                try:
+                    parsed = json.loads(json_block)
+                    if isinstance(parsed, list):
+                        json_array = parsed
+                    elif isinstance(parsed, dict):
+                        json_array = [parsed]
+                except json.JSONDecodeError as e:
+                    logger.warning(f"JSON decode error (no marker): {e}")
+    
+    return main_text, json_array
+
+def call_deepseek_hebrew(word: str) -> Dict[str, Any]:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": USER_INSTRUCTIONS.format(word=word)}
@@ -217,101 +372,57 @@ def call_deepseek(word: str) -> Dict[str, Any]:
     else:
         raise RuntimeError("DeepSeek failed after retries")
     
-    # -------- Robust JSON extraction --------
-    # Remove markdown fences if present
-    cleaned = text.replace("```json", "").replace("```", "").strip()
-    main_text = cleaned
-    derived: List[Dict[str, Any]] = []
-
-    # Look for DERIVED_JSON: marker
-    json_start = cleaned.find("DERIVED_JSON:")
-    if json_start != -1:
-        # Find the opening bracket after DERIVED_JSON:
-        bracket_start = cleaned.find("[", json_start)
-        if bracket_start != -1:
-            # Count brackets to find the matching closing bracket
-            bracket_count = 0
-            bracket_end = -1
-            for i in range(bracket_start, len(cleaned)):
-                if cleaned[i] == '[':
-                    bracket_count += 1
-                elif cleaned[i] == ']':
-                    bracket_count -= 1
-                    if bracket_count == 0:
-                        bracket_end = i + 1
-                        break
-            
-            if bracket_end != -1:
-                json_block = cleaned[bracket_start:bracket_end].strip()
-                main_text = cleaned[:json_start].strip()
-            else:
-                logger.warning("Could not find matching bracket for DERIVED_JSON")
-                return {"main_text": text.strip(), "derived": []}
+    main_text, raw_derived = extract_json_array(text, "DERIVED_JSON:")
+    
+    # Validate derived items
+    derived = []
+    for item in raw_derived:
+        if isinstance(item, dict) and all(k in item for k in ["hebrew", "translit", "english"]):
+            derived.append(item)
         else:
-            logger.warning("No opening bracket found after DERIVED_JSON:")
-            return {"main_text": text.strip(), "derived": []}
-    else:
-        # Fallback: try to find first JSON array
-        bracket_start = cleaned.find("[")
-        if bracket_start != -1:
-            bracket_count = 0
-            bracket_end = -1
-            for i in range(bracket_start, len(cleaned)):
-                if cleaned[i] == '[':
-                    bracket_count += 1
-                elif cleaned[i] == ']':
-                    bracket_count -= 1
-                    if bracket_count == 0:
-                        bracket_end = i + 1
-                        break
-            
-            if bracket_end != -1:
-                json_block = cleaned[bracket_start:bracket_end].strip()
-                main_text = (cleaned[:bracket_start] + cleaned[bracket_end:]).strip()
-            else:
-                logger.warning("No JSON found in DeepSeek response")
-                return {"main_text": text.strip(), "derived": []}
-        else:
-            logger.warning("No JSON found in DeepSeek response")
-            return {"main_text": text.strip(), "derived": []}
-
-    try:
-        derived = json.loads(json_block)
-        if not isinstance(derived, list):
-            logger.warning("DERIVED_JSON is not a list, wrapping in list")
-            derived = [derived]
-        
-        # Validate structure of derived items
-        validated_derived = []
-        for idx, item in enumerate(derived):
-            if not isinstance(item, dict):
-                logger.warning(f"Derived item {idx} is not a dict: {type(item)}")
-                continue
-            if "hebrew" not in item or "translit" not in item or "english" not in item:
-                logger.warning(f"Derived item {idx} missing required keys: {item.keys()}")
-                continue
-            validated_derived.append(item)
-        
-        derived = validated_derived
-        
-    except json.JSONDecodeError as e:
-        logger.warning(f"Failed to parse DERIVED_JSON: {e}")
-        logger.warning(f"JSON block (first 300 chars): {json_block[:300]}")
-        logger.warning(f"JSON block (last 100 chars): {json_block[-100:]}")
-        derived = []
-    except Exception as e:
-        logger.warning(f"Unexpected error parsing DERIVED_JSON: {e}")
-        logger.warning(f"Attempted to parse: {json_block[:200]}")
-        derived = []
-
+            logger.warning(f"Skipping invalid derived item: {item}")
+    
     return {
         "main_text": main_text.strip(),
         "derived": derived
     }
 
-# --------------------
-# DeepSeek call - phrase breakdown
-# --------------------
+def call_deepseek_arabic(word: str) -> Dict[str, Any]:
+    messages = [
+        {"role": "system", "content": ARABIC_SYSTEM_PROMPT},
+        {"role": "user", "content": ARABIC_USER_INSTRUCTIONS.format(word=word)}
+    ]
+    
+    for _ in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                temperature=TEMPERATURE
+            )
+            text = resp.choices[0].message.content.strip()
+            break
+        except Exception as e:
+            logger.warning(f"DeepSeek error, retrying: {e}")
+            time.sleep(2)
+    else:
+        raise RuntimeError("DeepSeek failed after retries")
+    
+    main_text, raw_buttons = extract_json_array(text, "BUTTONS_JSON:")
+    
+    # Validate button items
+    buttons_data = []
+    for item in raw_buttons:
+        if isinstance(item, dict) and all(k in item for k in ["arabic", "translit", "english"]):
+            buttons_data.append(item)
+        else:
+            logger.warning(f"Skipping invalid button item: {item}")
+    
+    return {
+        "main_text": main_text.strip(),
+        "buttons_data": buttons_data
+    }
+
 def call_deepseek_phrase(phrase: str) -> str:
     messages = [
         {"role": "system", "content": PHRASE_SYSTEM_PROMPT},
@@ -332,7 +443,39 @@ def call_deepseek_phrase(phrase: str) -> str:
     raise RuntimeError("DeepSeek failed after retries")
 
 # --------------------
-# Parsing roots
+# Sheet operations
+# --------------------
+def append_hebrew_to_sheet(hebrew, translit, english, heb_root, ar_root, ar_examples):
+    all_vals = sheet_hebrew.col_values(1)
+    existing = all_vals[1:] if len(all_vals) > 1 else []
+    
+    if hebrew in existing:
+        logger.info(f"Duplicate Hebrew skipped: {hebrew}")
+        return False
+    
+    row = [hebrew, translit, english, heb_root, ar_root, ar_examples]
+    sheet_hebrew.append_row(row, value_input_option="USER_ENTERED")
+    logger.info(f"Appended Hebrew: {hebrew}")
+    return True
+
+def append_arabic_to_sheet(english: str, arabic: str, translit: str, original_word: str):
+    try:
+        all_arabic = sheet_arabic.col_values(2)
+        existing = all_arabic[1:] if len(all_arabic) > 1 else []
+        
+        if arabic in existing:
+            logger.info(f"Duplicate Arabic skipped: {arabic}")
+            return False
+    except Exception as e:
+        logger.warning(f"Error checking duplicates: {e}")
+    
+    row = [english, arabic, translit, original_word]
+    sheet_arabic.append_row(row, value_input_option="USER_ENTERED")
+    logger.info(f"Appended Arabic: {arabic}")
+    return True
+
+# --------------------
+# Helper functions
 # --------------------
 def extract_roots_and_arabic(main_text: str):
     heb_root = "unknown"
@@ -364,42 +507,57 @@ def extract_roots_and_arabic(main_text: str):
                 capture = True
                 continue
             if capture and line.startswith("*"):
-                examples.append(line.strip("* ").strip())
+                # Remove leading "* " and any extra whitespace
+                example = line.lstrip("* ").strip()
+                if example:
+                    examples.append(example)
+        
+        # FIXED BUG 2: Proper joining of examples
         if examples:
-            ar_examples = examples[0] + ("\n* " + "\n* ".join(examples[1:]) if len(examples) > 1 else "")
-        else:
-            ar_examples = "none"
+            ar_examples = "\n* ".join(examples)
     
     return heb_root, ar_root, ar_examples
 
-# --------------------
-# Sheet append with duplicate check
-# --------------------
-def append_to_sheet(hebrew, translit, english, heb_root, ar_root, ar_examples):
-    # FIXED: Safe header check
-    all_vals = sheet.col_values(1)
-    existing = all_vals[1:] if len(all_vals) > 1 else []
+def detect_language(text: str) -> str:
+    """Detect if text is Hebrew, Arabic, or mixed with priority."""
+    has_hebrew = bool(re.search(r'[\u05D0-\u05EA]', text))
+    has_arabic = bool(re.search(r'[\u0600-\u06FF]', text))
     
-    if hebrew in existing:
-        logger.info(f"Duplicate skipped: {hebrew}")
-        return False
-    
-    row = [hebrew, translit, english, heb_root, ar_root, ar_examples]
-    sheet.append_row(row, value_input_option="USER_ENTERED")
-    logger.info(f"Appended: {hebrew}")
-    return True
-
-# --------------------
-# Input detection helper
-# --------------------
-def is_hebrew_text(text: str) -> bool:
-    """Returns True if text contains Hebrew letters (allowing spaces and punctuation)."""
-    return bool(re.search(r'[\u05D0-\u05EA]', text))
+    if has_hebrew and has_arabic:
+        # Mixed - count which one dominates
+        hebrew_chars = len(re.findall(r'[\u05D0-\u05EA]', text))
+        arabic_chars = len(re.findall(r'[\u0600-\u06FF]', text))
+        if hebrew_chars >= arabic_chars:
+            return "hebrew"
+        else:
+            return "arabic"
+    elif has_hebrew:
+        return "hebrew"
+    elif has_arabic:
+        return "arabic"
+    else:
+        return "unknown"
 
 def count_hebrew_words(text: str) -> int:
-    """Count space-separated tokens that contain Hebrew letters."""
     tokens = text.strip().split()
     return sum(1 for t in tokens if re.search(r'[\u05D0-\u05EA]', t))
+
+def is_single_hebrew_word(text: str) -> bool:
+    cleaned = re.sub(r'[^\u05D0-\u05EA]', '', text.strip())
+    return bool(HEBREW_WORD_RE.match(cleaned)) and len(text.strip().split()) == 1
+
+def is_single_arabic_word(text: str) -> bool:
+    cleaned = re.sub(r'[^\u0600-\u06FF\u0750-\u077F]', '', text.strip())
+    return bool(ARABIC_WORD_RE.match(cleaned)) and len(text.strip().split()) == 1
+
+def cleanup_last_results():
+    """Prevent memory leak by limiting cache size"""
+    if len(LAST_RESULTS) > MAX_CACHED_CHATS:
+        # Remove oldest 20% of entries
+        keys_to_remove = list(LAST_RESULTS.keys())[:MAX_CACHED_CHATS // 5]
+        for key in keys_to_remove:
+            del LAST_RESULTS[key]
+        logger.info(f"Cleaned up {len(keys_to_remove)} cached entries")
 
 # --------------------
 # Telegram handlers
@@ -411,128 +569,209 @@ def handle_message(msg: Dict[str, Any]):
     # Handle /start command
     if text == "/start":
         send_message(chat_id, 
-            "👋 <b>Welcome to Hebrew Etymology Bot!</b>\n\n"
-            "📝 <b>Single word</b> → root, etymology &amp; Arabic cognates\n"
+            "👋 <b>Welcome to Hebrew & Arabic Etymology Bot!</b>\n\n"
+            "📝 <b>Single Hebrew word</b> → root, etymology & Arabic cognates\n"
             "   Example: send <b>מכין</b>\n\n"
-            "📖 <b>Phrase or sentence</b> → word-by-word breakdown\n"
+            "🇸🇦 <b>Single Arabic word</b> → root, Hebrew cognate & common conjugations\n"
+            "   Example: send <b>كتب</b>\n\n"
+            "📖 <b>Hebrew phrase/sentence</b> → word-by-word breakdown\n"
             "   Example: send <b>האם הציפורן הפתוחה שלך פועלת</b>\n\n"
-            "💾 Tap buttons (single-word mode) to save derived words to your Google Sheet"
+            "💾 Tap buttons to save derived words to your Google Sheet\n"
+            "   - Hebrew words → 'Hebrew' tab\n"
+            "   - Arabic words → 'Arabic' tab"
         )
         return
     
-    if not is_hebrew_text(text):
-        send_message(chat_id, "❗ Please send Hebrew text — either a single word or a phrase/sentence.")
+    # Detect language with priority
+    lang = detect_language(text)
+    
+    if lang == "unknown":
+        send_message(chat_id, "❗ Please send Hebrew or Arabic text.")
         return
-
-    word_count = count_hebrew_words(text)
-
-    # ── MODE 2: phrase/sentence (2+ Hebrew words) ──
-    if word_count >= 2:
-        send_message(chat_id, "🔍 Breaking down phrase...")
+    
+    # ----- HEBREW MODE -----
+    if lang == "hebrew":
+        word_count = count_hebrew_words(text)
+        
+        # Phrase/sentence mode (2+ words)
+        if word_count >= 2:
+            send_message(chat_id, "🔍 Breaking down Hebrew phrase...")
+            try:
+                breakdown = call_deepseek_phrase(text)
+                send_message(chat_id, breakdown)
+            except Exception as e:
+                logger.exception("Error processing Hebrew phrase")
+                send_message(chat_id, f"❌ Error: {e}")
+            return
+        
+        # Single Hebrew word mode
+        if not is_single_hebrew_word(text):
+            send_message(chat_id, "❗ Please send a single Hebrew word (letters only, no vowel points).")
+            return
+        
+        send_message(chat_id, "🤖 Analyzing Hebrew word...")
+        
         try:
-            breakdown = call_deepseek_phrase(text)
-            send_message(chat_id, breakdown)
+            result = call_deepseek_hebrew(text)
+            main_text = result["main_text"]
+            derived = result["derived"]
+            
+            heb_root, ar_root, ar_examples = extract_roots_and_arabic(main_text)
+            
+            LAST_RESULTS[chat_id] = {
+                "type": "hebrew",
+                "heb_root": heb_root,
+                "ar_root": ar_root,
+                "ar_examples": ar_examples,
+                "derived": derived
+            }
+            cleanup_last_results()
+            
+            buttons = []
+            for i, d in enumerate(derived):
+                hebrew = d.get("hebrew", "")
+                translit = d.get("translit", "")
+                english = d.get("english", "")
+                
+                if not hebrew or not translit or not english:
+                    continue
+                
+                label = f"💾 {hebrew} - {translit} - {english[:40]}"
+                if len(label) > 60:
+                    label = label[:57] + "..."
+                buttons.append([{
+                    "text": label,
+                    "callback_data": f"save_hebrew:{i}"
+                }])
+            
+            reply_markup = {"inline_keyboard": buttons} if buttons else None
+            send_message(chat_id, main_text, reply_markup=reply_markup)
+        
         except Exception as e:
-            logger.exception("Error processing phrase")
+            logger.exception("Error processing Hebrew word")
             send_message(chat_id, f"❌ Error: {e}")
-        return
-
-    # ── MODE 1: single word ──
-    # Strip any non-Hebrew characters for the single-word check
-    word_only = re.sub(r'[^\u05D0-\u05EA]', '', text)
-    if not HEBREW_WORD_RE.match(word_only):
-        send_message(chat_id, "❗ Please send a single Hebrew word (letters only, no vowel points).")
-        return
-
-    send_message(chat_id, "🤖 Analyzing...")
     
-    try:
-        result = call_deepseek(word_only)
-        main_text = result["main_text"]
-        derived = result["derived"]
+    # ----- ARABIC MODE -----
+    elif lang == "arabic":
+        if not is_single_arabic_word(text):
+            send_message(chat_id, "❗ Please send a single Arabic word (letters only, no spaces).")
+            return
         
-        heb_root, ar_root, ar_examples = extract_roots_and_arabic(main_text)
+        send_message(chat_id, "🤖 Analyzing Arabic word...")
         
-        LAST_RESULTS[chat_id] = {
-            "heb_root": heb_root,
-            "ar_root": ar_root,
-            "ar_examples": ar_examples,
-            "derived": derived
-        }
-        
-        buttons = []
-        for i, d in enumerate(derived):
-            # Safely access dict keys with defaults
-            hebrew = d.get("hebrew", "")
-            translit = d.get("translit", "")
-            english = d.get("english", "")
+        try:
+            result = call_deepseek_arabic(text)
+            main_text = result["main_text"]
+            buttons_data = result["buttons_data"]
             
-            if not hebrew or not translit or not english:
-                logger.warning(f"Skipping derived item {i} with missing fields: {d}")
-                continue
+            LAST_RESULTS[chat_id] = {
+                "type": "arabic",
+                "original_word": text,
+                "buttons_data": buttons_data
+            }
+            cleanup_last_results()
             
-            label = f"{hebrew} - {translit} - {english}"
-            if len(label) > 60:
-                label = label[:57] + "..."
-            buttons.append([{
-                "text": label,
-                "callback_data": f"save:{i}"
-            }])
+            buttons = []
+            for i, item in enumerate(buttons_data):
+                arabic = item.get("arabic", "")
+                translit = item.get("translit", "")
+                english = item.get("english", "")
+                
+                if not arabic or not translit or not english:
+                    continue
+                
+                label = f"📖 {arabic} - {translit} - {english[:35]}"
+                if len(label) > 60:
+                    label = label[:57] + "..."
+                buttons.append([{
+                    "text": label,
+                    "callback_data": f"save_arabic:{i}"
+                }])
+            
+            if buttons:
+                main_text += "\n\n<code>👇 Tap any word below to save it to your Arabic vocabulary sheet</code>"
+            
+            reply_markup = {"inline_keyboard": buttons} if buttons else None
+            send_message(chat_id, main_text, reply_markup=reply_markup)
         
-        reply_markup = {"inline_keyboard": buttons} if buttons else None
-        send_message(chat_id, main_text, reply_markup=reply_markup)
-    
-    except Exception as e:
-        logger.exception("Error processing word")
-        send_message(chat_id, f"❌ Error: {e}")
+        except Exception as e:
+            logger.exception("Error processing Arabic word")
+            send_message(chat_id, f"❌ Error: {e}")
 
 def handle_callback(cb: Dict[str, Any]):
     cb_id = cb["id"]
     chat_id = cb["message"]["chat"]["id"]
     data = cb["data"]
     
-    if not data.startswith("save:"):
+    # Hebrew save
+    if data.startswith("save_hebrew:"):
+        idx = int(data.split(":")[1])
+        cached = LAST_RESULTS.get(chat_id)
+        
+        if not cached or cached.get("type") != "hebrew" or idx >= len(cached.get("derived", [])):
+            answer_callback(cb_id, "❌ Expired")
+            return
+        
+        d = cached["derived"][idx]
+        hebrew = d.get("hebrew")
+        translit = d.get("translit")
+        english = d.get("english")
+        
+        if not hebrew or not translit or not english:
+            answer_callback(cb_id, "❌ Invalid data")
+            return
+        
+        try:
+            saved = append_hebrew_to_sheet(
+                hebrew,
+                translit,
+                english,
+                cached.get("heb_root", "unknown"),
+                cached.get("ar_root", "none"),
+                cached.get("ar_examples", "none")
+            )
+            answer_callback(cb_id, "✔️ Saved to Hebrew tab" if saved else "⚠️ Duplicate")
+        except Exception as e:
+            logger.exception("Sheet append failed for Hebrew")
+            answer_callback(cb_id, "❌ Error")
+    
+    # Arabic save
+    elif data.startswith("save_arabic:"):
+        idx = int(data.split(":")[1])
+        cached = LAST_RESULTS.get(chat_id)
+        
+        if not cached or cached.get("type") != "arabic" or idx >= len(cached.get("buttons_data", [])):
+            answer_callback(cb_id, "❌ Expired")
+            return
+        
+        item = cached["buttons_data"][idx]
+        arabic = item.get("arabic")
+        translit = item.get("translit")
+        english = item.get("english")
+        original_word = cached.get("original_word", "")
+        
+        if not arabic or not translit or not english:
+            answer_callback(cb_id, "❌ Invalid data")
+            return
+        
+        try:
+            saved = append_arabic_to_sheet(english, arabic, translit, original_word)
+            answer_callback(cb_id, "✔️ Saved to Arabic tab" if saved else "⚠️ Duplicate")
+        except Exception as e:
+            logger.exception("Sheet append failed for Arabic")
+            answer_callback(cb_id, "❌ Error")
+    
+    else:
         answer_callback(cb_id, "❌")
-        return
-    
-    idx = int(data.split(":")[1])
-    cached = LAST_RESULTS.get(chat_id)
-    
-    if not cached or idx >= len(cached["derived"]):
-        answer_callback(cb_id, "❌ Expired")
-        return
-    
-    d = cached["derived"][idx]
-    
-    # Validate derived item structure
-    hebrew = d.get("hebrew")
-    translit = d.get("translit")
-    english = d.get("english")
-    
-    if not hebrew or not translit or not english:
-        logger.error(f"Invalid derived item at index {idx}: {d}")
-        answer_callback(cb_id, "❌ Invalid data")
-        return
-    
-    try:
-        saved = append_to_sheet(
-            hebrew,
-            translit,
-            english,
-            cached["heb_root"],
-            cached["ar_root"],
-            cached["ar_examples"]
-        )
-        answer_callback(cb_id, "✔️" if saved else "⚠️ Duplicate")
-    except Exception as e:
-        logger.exception("Sheet append failed")
-        answer_callback(cb_id, "❌ Error")
 
 # --------------------
-# Long polling loop
+# Long polling loop with FIXED allowed_updates
 # --------------------
 def get_updates(offset=None):
-    params = {"timeout": 30}
+    params = {
+        "timeout": 30,
+        "allowed_updates": ["message", "callback_query"]  # FIXED BUG 4: Filter update types
+    }
     if offset:
         params["offset"] = offset
     r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=35)
@@ -540,7 +779,7 @@ def get_updates(offset=None):
     return r.json()["result"]
 
 def main():
-    logger.info("Starting bot...")
+    logger.info("Starting Hebrew+Arabic bot...")
     init_deepseek()
     init_google_sheets()
     
@@ -556,6 +795,9 @@ def main():
                     handle_message(u["message"])
                 elif "callback_query" in u:
                     handle_callback(u["callback_query"])
+                else:
+                    # Log but skip other update types (like edited_message, channel_post)
+                    logger.debug(f"Skipping non-handled update type: {u.keys()}")
         except Exception as e:
             logger.error(f"Main loop error: {e}")
             time.sleep(5)
